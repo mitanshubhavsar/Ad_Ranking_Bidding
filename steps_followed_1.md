@@ -35,8 +35,6 @@ Environment
 
 Env `ads_cross` (Python 3.11): torch 2.14 with CUDA on 2 RTX 4090s, duckdb 1.5.5, polars, pyarrow, pandas 3.0.5, scikit-learn, xgboost, lightgbm, pytest. Machine: 125 GB RAM, 32 cores.
 
-One weak spot: `typing_extensions` is not inside the env. Torch finds it in the shared `~/.local` folder. If `PYTHONNOUSERSITE=1` is set, `import torch` fails. Nothing changed yet.
-
 
 STEP 3
 
@@ -47,7 +45,7 @@ Four tables. One row means a different thing in each.
 | Table | Rows | One row is | Columns |
 |---|---|---|---|
 | raw_sample | 26,557,961 (measured) | one ad shown to one user | user, time_stamp, adgroup_id, pid, nonclk, clk |
-| behavior_log | about 723M (old project) | one shopping event by one user | user, time_stamp, btag, cate, brand |
+| behavior_log | 723,268,134 (measured) | one shopping event by one user | user, time_stamp, btag, cate, brand |
 | ad_feature | 846,811 (measured) | one ad unit | adgroup_id, cate_id, campaign_id, customer, brand, price |
 | user_profile | 1,061,768 (measured) | one user | userid, cms_segid, cms_group_id, final_gender_code, age_level, pvalue_level, shopping_level, occupation, new_user_class_level |
 
@@ -56,6 +54,8 @@ How they connect:
 - raw_sample.adgroup_id = ad_feature.adgroup_id
 
 Time span: exactly 8 days, 2017-05-06 00:00 to 2017-05-13 23:59, Beijing time (measured). About 3.2M to 3.4M impressions per day. The last day has 3,308,665 rows. That matters later for the time split.
+
+Behaviour log window: 22 days, 2017-04-22 to 2017-05-13 (measured), about 30M to 37M events per day. So even the first impression day (05-06) has 14 days of history before it.
 
 Timezone note: timestamps are Beijing time (UTC+8). The first one, 1494000000, is exactly 2017-05-06 00:00 there. DuckDB uses the machine's own timezone by default (+05:30 here), which showed a fake ninth day (170,507 rows on 2017-05-05). Fixed by setting `TimeZone='Asia/Shanghai'` in the notebooks and in `dq_report.py`.
 
@@ -79,11 +79,15 @@ Problems that need cleaning
 | pvalue_level missing in user_profile | 575,917 (54%) (measured) | Too many to drop. Missing is its own signal. |
 | new_user_class_level missing | 344,920 (32%) (measured) | Same. |
 | age_level = 0 | 501 users (measured) | Levels should be 1 to 6. Treat as unknown. |
-| Corrupt timestamps in behavior_log | years 1918 to 2032 in the first 5M rows (sample only) | A 1918 event would look like very old but valid history. Must be removed. |
-| Exact duplicate rows in behavior_log | 349,113 of the first 5M rows (7.0%) (sample only) | Could be real repeat views or logging copies. A sequence model would see the same item twice. |
-| Bot-like users with extreme event counts | not measured yet | A few users could produce huge histories. |
+| Timestamps outside the 22-day window in behavior_log | 154,811 rows (0.02%), spread from 1902 to 2036 (measured) | A 1902 event would look like very old but valid history. Rare, so cheap to remove. |
+| Exact duplicate rows in behavior_log | 51,900,517 (7.18%) (measured). raw_sample has 0. | Could be real repeat views or logging copies. A sequence model would see the same item twice. |
+| Heavy users in behavior_log | events per user: median 387, p90 1,468, p99 3,751, p99.9 7,111, max 43,559 (measured) | Long tail, but no clear bot spike. Handle by capping history length. |
 
-The sample is the first rows of the file, not a random sample. The last three rows of the table are signals to check, not estimates. `dq_report.py` measures them on all 723M rows.
+The first run of the notebook only saw the first 5M rows and guessed these; `dq_report.py` then measured them on all 723M rows. The sample guess (7.0% duplicates) was close to the real 7.18%.
+
+Event mix in behavior_log (measured): pv 95.25%, cart 2.20%, fav 1.29%, buy 1.26% (9.1M purchases).
+Users with both a click and a non-click: 487,294 of 1,141,729 (42.7%). Only these can be scored by GAUC.
+Join coverage (measured, matches the old project): 99.91% of impressions and 99.53% of users have at least one behaviour event.
 
 Things that turned out fine:
 - Every ad unit in raw_sample exists in ad_feature (846,811 of 846,811).
@@ -114,31 +118,41 @@ Why explicit types matter, shown on ad_feature:
 
 The automatic read hides the problem. The explicit read shows it.
 
+Why Parquet instead of keeping the CSVs:
+- Smaller: `behavior_log` goes from 23.7 GB to 4.14 GB, and the 4 tables total 4.1 GB.
+- Faster: a query reads only the columns it needs. Every later step reads `behavior_log` many times.
+- Types and nulls are fixed once here, so no later script can read `brand` as text by mistake.
+- The CSV is untouched. Parquet can be rebuilt any time.
+
 `src/data/dq_report.py` then writes `outputs/results/dq_report.json` (read-only, drops nothing). It measures: null rates, rows per day, timestamp range, duplicate rates, click rate, events per user (median up to max), price quantiles, users with both labels, and impression-to-behaviour join coverage.
 
-Where the rows went (to be filled after running)
+What the report is for: it is a reference, not an input. No code reads it yet. We use it to choose the cleaning rules (STEP 6), and after cleaning we run it again to check the change equals what the cleaning script says it removed. Its numbers also go into the final report.
+
+Where the rows went
 
 | Table | CSV rows | Parquet rows | Match |
 |---|---|---|---|
-| raw_sample | 26,557,961 | | |
-| behavior_log | | | |
-| ad_feature | 846,811 | | |
-| user_profile | 1,061,768 | | |
+| raw_sample | 26,557,961 | 26,557,961 | yes |
+| behavior_log | not counted separately | 723,268,134 | equals the old project's 723M |
+| ad_feature | 846,811 | 846,811 | yes |
+| user_profile | 1,061,768 | 1,061,768 | yes |
 
-Status: both scripts are written, not run yet.
+Status: both scripts have been run. Saved so far: `data/processed/raw_parquet/` (typed but still dirty) and `outputs/results/dq_report.json`. Nothing has been cleaned yet, so no cleaned data exists.
+
+Known flaw in `dq_report.py`: `behavior_log_rows_per_day_cst` lists about 1,000 "days" because the corrupt timestamps each create their own. Planned fix: report only the 22 real days plus one "outside the window" count.
 
 
 STEP 6
 
-Decisions to take after dq_report (nothing applied yet)
+Decisions to take now that dq_report is done (nothing applied yet)
 
-Each one is a proposal. The numbers from the full report decide.
+Each one is still a proposal. The full-data numbers are in STEP 4.
 
 | Question | Options | Proposal | Why |
 |---|---|---|---|
-| Timestamps outside the window | keep all / drop outside a valid range | Drop rows outside the range where the data actually lives | Impressions are 2017-05-06 to 05-13. Events after an impression are never used anyway, so only the very old garbage (1918) can hurt, by showing up as fake history. |
-| Duplicate behaviour rows | keep / drop exact duplicates | Drop exact duplicates, report the count | Duplicates make one view look like many. Check first whether they cluster in the same second on the same item. |
-| Bot-like users | drop users / cap history | Do not drop anyone. Cap each history at the last K events | Dropping users removes test impressions, so the test set would change. A cap handles heavy users without that. |
+| Timestamps outside the window | keep all / drop outside 2017-04-22 to 2017-05-13 | Drop the 154,811 rows outside the window | Events after an impression are never used anyway, so only the very old garbage (1902) can hurt, by showing up as fake history. |
+| Duplicate behaviour rows (51.9M, 7.18%) | keep / drop exact duplicates | **Open: your call.** My lean: drop them | Duplicates make one view look like many, but some may be real repeat views. Check first whether they cluster in the same second on the same item. |
+| Heavy users (max 43,559 events) | drop users / cap history | **Open: your call.** My lean: do not drop anyone, cap each history at the last K events | Dropping users removes test impressions, so the test set would change. A cap handles heavy users without that. K is chosen later from the sequence-length numbers. |
 | Price | keep / cap and log | Cap at the 99.9th percentile, then log | One value of 99,999,999 should not drive the feature. |
 | Missing brand, pvalue_level, new_user_class_level | drop / fill with average / own category | Own "unknown" category | 29% to 54% missing. Missing may carry information. Averaging would hide it. |
 | Users with no profile (7%) | drop / keep | Keep, mark profile features unknown | Dropping them changes who is in the test set. |
@@ -176,8 +190,8 @@ Where we are
 
 | Done | Not done yet |
 |---|---|
-| Dataset chosen and copied | Run `ingest_taobao.py` and `dq_report.py` |
-| Env checked | Fill the row-accounting table in STEP 5 |
-| Raw data studied (`notebooks/00_dataset_study.ipynb`) | Decide STEP 6 and write cleaning script and tests |
-| Two scripts written, walkthrough notebook (`01_ingestion_walkthrough.ipynb`) | Time split and leakage tests (STEP 7) |
-| | Features, baselines, models |
+| Dataset chosen and copied | Decide the two open cleaning questions (STEP 6) |
+| Env checked | Write `clean_taobao.py` + one test per rule, output to `data/processed/clean/` |
+| Raw data studied (`notebooks/00_dataset_study.ipynb`) | Shorten `dq_report.py` rows-per-day output, re-run it on the cleaned data |
+| Ingestion run: 4 Parquet tables saved (4.1 GB), row counts match | Time split and leakage tests (STEP 7) |
+| DQ report run: `outputs/results/dq_report.json` | Features, baselines, models |

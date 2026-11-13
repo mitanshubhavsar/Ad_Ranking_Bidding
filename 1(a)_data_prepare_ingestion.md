@@ -6,7 +6,7 @@
 | Table | Rows | Role |
 |---|---|---|
 | `raw_sample` | 26,557,961 (measured) | Ad impressions with click label `clk` |
-| `behavior_log` | ~723M (from earlier project, not yet re-counted) | Past user events: pv / cart / fav / buy |
+| `behavior_log` | 723,268,134 (measured) | Past user events: pv / cart / fav / buy |
 | `ad_feature` | 846,811 (measured) | Ad features (category, campaign, brand, price) |
 | `user_profile` | 1,061,768 (measured) | User features (age, gender, shopping level, ...) |
 
@@ -38,7 +38,7 @@ Messiness found:
 
 A bug caught on the way: DuckDB uses the machine timezone (+05:30), which shifted the per-day counts. Fixed by setting `TimeZone='Asia/Shanghai'`.
 
-### 3. Wrote the ingestion pipeline (`src/data/`)
+### 3. Wrote and ran the ingestion pipeline (`src/data/`)
 | Script | What it does |
 |---|---|
 | `ingest_taobao.py` | Reads the 4 CSVs with explicit column types; `NULL` text and empty cells become real nulls; renames `userid` to `user`; writes zstd Parquet to `data/processed/raw_parquet/`. Drops no rows. |
@@ -46,16 +46,44 @@ A bug caught on the way: DuckDB uses the machine timezone (+05:30), which shifte
 
 Both cap DuckDB at 48 GB RAM and 16 threads (lower these if the machine is shared).
 
+**What ingestion produced (both scripts have been run):**
+
+| File | Rows | Size |
+|---|---|---|
+| `raw_sample.parquet` | 26,557,961 | 0.18 GB |
+| `behavior_log.parquet` | 723,268,134 | 4.14 GB |
+| `ad_feature.parquet` | 846,811 | 9 MB |
+| `user_profile.parquet` | 1,061,768 | 5 MB |
+
+24 GB of CSV became 4.1 GB of Parquet in about 2 minutes. Row counts match the CSVs. No rows were dropped, so these files are typed but still dirty.
+
+**Why Parquet:** about 6x smaller, reads only the columns a query needs (every later step reads `behavior_log` many times), types and nulls are fixed once so no later script can misread them, and the CSV stays untouched so Parquet can always be rebuilt.
+
+**What the DQ report found on the full data:**
+- `behavior_log` covers 22 days (2017-04-22 to 2017-05-13), so the first impression day has 14 days of history.
+- 154,811 rows (0.02%) have timestamps outside that window, from 1902 to 2036.
+- 51,900,517 exact duplicate rows (7.18%) in `behavior_log`; none in `raw_sample`.
+- Events per user: median 387, p99 3,751, max 43,559. Long tail, no clear bot spike.
+- Event mix: pv 95.25%, cart 2.20%, fav 1.29%, buy 1.26%.
+- 487,294 of 1,141,729 users (42.7%) have both a click and a non-click, so only they count in GAUC.
+- Join coverage: 99.91% of impressions and 99.53% of users have behaviour history (matches the old project).
+- Missing: `brand` 29.1%, `pvalue_level` 54.2%, `new_user_class_level` 32.5%. Price max 99,999,999, median 139.
+
+**What the report is for:** reference, not an input. No code reads it yet. It guides the cleaning rules, and we re-run it after cleaning to check the change equals what the cleaning script removed. Known flaw: its per-day list for `behavior_log` has about 1,000 entries because corrupt timestamps each make a "day". To be shortened.
+
+**Saved so far:** `data/processed/raw_parquet/` and `outputs/results/dq_report.json`. **Cleaning has not been done**, so no cleaned data exists yet.
+
 ### 4. Wrote and ran study notebooks (`notebooks/`)
-- `00_dataset_study.ipynb`: the column study above.
-- `01_ingestion_walkthrough.ipynb`: explains the scripts, shows the effect of null handling on `ad_feature` (default read: `brand` becomes text with 0 nulls; typed read: 246,330 nulls), and displays the real pipeline output once it exists.
+- `00_dataset_study.ipynb`: the column study above, with short "how to read this" notes after the outputs.
+- `01_ingestion_walkthrough.ipynb`: explains the scripts, shows the effect of null handling on `ad_feature` (default read: `brand` becomes text with 0 nulls; typed read: 246,330 nulls), and displays the real pipeline output.
 - Notebooks are for studying only; `src/` is the real pipeline.
 
 ## Next steps
-1. Run `python -m src.data.ingest_taobao`, then `python -m src.data.dq_report` in `ads_cross` (**not run yet**).
-2. Read `dq_report.json` and decide the cleaning rules: valid timestamp window for `behavior_log`, duplicate handling, bot-user cutoff, price cap, treatment of missing profile fields and the 7% of users with no profile.
-3. Write a cleaning script plus one test per rule, and re-measure join coverage afterwards.
+1. **Decide two open cleaning questions:** (a) drop the 51.9M exact duplicates or keep them (lean: drop); (b) heavy users: do not drop anyone, cap each history at the last K events (lean: cap).
+2. Already proposed and not controversial: drop the 154,811 out-of-window rows; cap price at the 99.9th percentile then log; keep missing values and users without a profile as an "unknown" category.
+3. Write `src/data/clean_taobao.py` (reads `raw_parquet/`, writes `data/processed/clean/`) with a row-accounting table and one test per rule.
+4. Re-run the DQ report on the cleaned data and compare.
 
 ## Open items / not yet verified
-- `behavior_log` row count (723M) and join coverage (99.9% / 99.5%) come from the earlier project; the DQ report will re-measure them.
+- `behavior_log` row count and join coverage are now measured (see section 3).
 - Column meanings in the notebook dictionary come from the public Tianchi description (written from memory); only the ones checked against data are confirmed.
